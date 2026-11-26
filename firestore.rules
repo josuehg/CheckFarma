@@ -1,0 +1,62 @@
+rules_version = '2';
+// Reglas de seguridad de la app de inspecciones.
+// El administrador es el usuario "admin" (en Firebase: admin@usuarios.inspecciones.app). Debe coincidir con ADMIN_USER de public/config.js.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null; }
+    function boss() { return signed() && request.auth.token.email == 'admin@usuarios.inspecciones.app'; }
+    function userDoc() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function myRole() { return exists(userDoc()) ? get(userDoc()).data.role : 'none'; }
+    function admin() { return boss() || (signed() && myRole() == 'admin'); }
+    function sup() { return admin() || (signed() && myRole() == 'supervisor'); }
+    function active() { return admin() || (signed() && myRole() in ['operario', 'supervisor']); }
+
+    // Usuarios: cada uno crea su propia ficha como "pendiente"; solo el administrador cambia roles.
+    match /users/{uid} {
+      allow read: if signed() && (request.auth.uid == uid || active());
+      allow create: if signed() && request.auth.uid == uid
+                    && (request.resource.data.role == 'pendiente' || boss());
+      allow update: if admin()
+                    || (signed() && request.auth.uid == uid && request.resource.data.role == resource.data.role);
+      allow delete: if admin();
+    }
+
+    // Configuración: plantillas, sedes y ajustes los cambia el administrador.
+    match /templates/{id} { allow read: if active(); allow write: if admin(); }
+    match /sites/{id}     { allow read: if active(); allow write: if admin(); }
+    match /meta/{id}      { allow read: if active(); allow write: if admin(); }
+
+    // Agenda: supervisores; cualquier activo puede crear una reinspección automática (una vez).
+    match /schedules/{id} {
+      allow read: if active();
+      allow create, update: if sup() || (active() && request.resource.data.freq == 'once');
+      allow delete: if sup();
+    }
+
+    // Inspecciones: cada uno crea las suyas; solo supervisores aprueban o rechazan.
+    match /inspections/{id} {
+      allow read: if active();
+      allow create: if active() && request.resource.data.inspectorId == request.auth.uid
+                    && request.resource.data.status in ['borrador', 'enviada', 'pendiente'];
+      allow update: if sup()
+                    || (active() && resource.data.inspectorId == request.auth.uid
+                        && request.resource.data.inspectorId == request.auth.uid
+                        && request.resource.data.status in ['borrador', 'enviada', 'pendiente']);
+      allow delete: if sup()
+                    || (active() && resource.data.inspectorId == request.auth.uid && resource.data.status == 'borrador');
+    }
+
+    // Acciones correctivas: todo el equipo activo las crea y actualiza; solo el administrador borra.
+    match /actions/{id} {
+      allow read, create, update: if active();
+      allow delete: if admin();
+    }
+
+    // Fotos (guardadas como imagen comprimida dentro de Firestore para que funcionen sin internet).
+    match /photos/{id} {
+      allow read: if active();
+      allow create: if active() && request.resource.data.by == request.auth.uid;
+      allow delete: if admin();
+    }
+  }
+}
